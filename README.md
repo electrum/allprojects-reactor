@@ -21,7 +21,7 @@ Using `-am` on the second command works, but it also executes lifecycle phases f
 
 ## Solution
 
-This extension contributes an additional `MavenWorkspaceReader` component.
+This extension contributes an additional `MavenWorkspaceReader`. A lifecycle participant installs it on the repository session when the session starts, so Maven chains it after its own reactor reader whether or not any project in the build declares a build extension.
 
 The built-in Maven reactor reader indexes:
 
@@ -96,6 +96,7 @@ This extension intentionally makes Maven willing to use existing workspace outpu
 - Attached artifacts/classifiers: the extension looks for attached artifacts known to the Maven project and previously packaged classifier files such as `target/${finalName}-tests.jar`. Unusual packaging or custom plugin behavior may require more handling.
 - Build reproducibility: this is best for local developer iteration. CI should usually run a complete, explicit build graph so it does not depend on previous `target/` contents.
 - Local repo confusion: if matching artifacts exist in the local repository, Maven may resolve from there depending on workspace reader ordering and artifact availability. For testing this behavior, use a clean local repo or verify the target artifacts are absent.
+- Archives before `package`: non-classpath artifacts such as `tar.gz` or `zip` distributions only exist once their module has run `package`. A reactor dependency on one (for example the `provided` dependencies the provisio plugin adds for build ordering) cannot be resolved by `test-compile`, with or without this extension.
 - Loose class fallback: by default, the extension can resolve main JAR artifacts from `target/classes` and test artifacts from `target/test-classes` when packaged artifacts are missing. Disable this with `-Dallprojects-reactor.resolveClasses=false` if you only want packaged artifacts to be used.
 
 ## Current Behavior

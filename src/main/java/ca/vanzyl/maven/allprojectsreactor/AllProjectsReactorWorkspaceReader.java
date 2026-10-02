@@ -14,7 +14,6 @@
 package ca.vanzyl.maven.allprojectsreactor;
 
 import org.apache.maven.RepositoryUtils;
-import org.apache.maven.SessionScoped;
 import org.apache.maven.artifact.ArtifactUtils;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.model.Model;
@@ -24,9 +23,6 @@ import org.eclipse.aether.artifact.Artifact;
 import org.eclipse.aether.repository.WorkspaceRepository;
 import org.eclipse.aether.util.artifact.ArtifactIdUtils;
 
-import javax.inject.Inject;
-import javax.inject.Named;
-
 import java.io.File;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -35,18 +31,17 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 
 /**
  * Makes all discovered reactor projects available for workspace resolution, even when {@code -pl} restricts execution.
+ * <p>
+ * Installed on the repository session by {@link AllProjectsReactorLifecycleParticipant} before the projects are read,
+ * so the project index is built lazily from the session on first use.
  */
-@Named
-@SessionScoped
-public final class AllProjectsReactorWorkspaceReader
+final class AllProjectsReactorWorkspaceReader
         implements MavenWorkspaceReader
 {
     private static final String RESOLVE_CLASSES_PROPERTY = "allprojects-reactor.resolveClasses";
@@ -54,48 +49,31 @@ public final class AllProjectsReactorWorkspaceReader
     private static final Collection<String> COMPILE_PHASE_TYPES = new HashSet<>(Arrays.asList(
             "jar", "ejb-client", "war", "rar", "ejb3", "par", "sar", "wsr", "har", "app-client"));
 
-    private final Map<String, MavenProject> projectsByGav;
-    private final Map<String, List<MavenProject>> projectsByGa;
-    private final WorkspaceRepository repository;
-    private final boolean resolveClasses;
+    private static final WorkspaceRepository REPOSITORY = new WorkspaceRepository("all-projects-reactor");
 
-    @Inject
-    public AllProjectsReactorWorkspaceReader(MavenSession session)
+    private final MavenSession session;
+    private final boolean resolveClasses;
+    private volatile ProjectIndex index;
+
+    AllProjectsReactorWorkspaceReader(MavenSession session)
     {
-        List<MavenProject> projects = session.getAllProjects();
-        if (projects == null || projects.isEmpty()) {
-            projects = session.getProjects();
-        }
+        this.session = session;
         this.resolveClasses = Boolean.parseBoolean(
                 session.getUserProperties().getProperty(
                         RESOLVE_CLASSES_PROPERTY,
                         session.getSystemProperties().getProperty(RESOLVE_CLASSES_PROPERTY, "true")));
-
-        this.projectsByGav = new HashMap<>();
-        this.projectsByGa = new HashMap<>();
-
-        Set<String> keys = new LinkedHashSet<>();
-        for (MavenProject project : projects) {
-            String gav = ArtifactUtils.key(project.getGroupId(), project.getArtifactId(), project.getVersion());
-            String ga = ArtifactUtils.versionlessKey(project.getGroupId(), project.getArtifactId());
-            projectsByGav.put(gav, project);
-            projectsByGa.computeIfAbsent(ga, _ -> new ArrayList<>()).add(project);
-            keys.add(gav);
-        }
-
-        this.repository = new WorkspaceRepository("all-projects-reactor", keys);
     }
 
     @Override
     public WorkspaceRepository getRepository()
     {
-        return repository;
+        return REPOSITORY;
     }
 
     @Override
     public File findArtifact(Artifact artifact)
     {
-        MavenProject project = projectsByGav.get(ArtifactUtils.key(
+        MavenProject project = index().projectsByGav().get(ArtifactUtils.key(
                 artifact.getGroupId(), artifact.getArtifactId(), artifact.getVersion()));
         if (project == null) {
             return null;
@@ -111,7 +89,7 @@ public final class AllProjectsReactorWorkspaceReader
     @Override
     public List<String> findVersions(Artifact artifact)
     {
-        List<MavenProject> projects = projectsByGa.get(ArtifactUtils.versionlessKey(
+        List<MavenProject> projects = index().projectsByGa().get(ArtifactUtils.versionlessKey(
                 artifact.getGroupId(), artifact.getArtifactId()));
         if (projects == null) {
             return Collections.emptyList();
@@ -129,9 +107,28 @@ public final class AllProjectsReactorWorkspaceReader
     @Override
     public Model findModel(Artifact artifact)
     {
-        MavenProject project = projectsByGav.get(ArtifactUtils.key(
+        MavenProject project = index().projectsByGav().get(ArtifactUtils.key(
                 artifact.getGroupId(), artifact.getArtifactId(), artifact.getVersion()));
         return project == null ? null : project.getModel();
+    }
+
+    private ProjectIndex index()
+    {
+        List<MavenProject> projects = session.getAllProjects();
+        if (projects == null || projects.isEmpty()) {
+            projects = session.getProjects();
+        }
+        if (projects == null) {
+            return ProjectIndex.EMPTY;
+        }
+
+        // Maven replaces the project lists whenever it rebuilds the project graph
+        ProjectIndex current = index;
+        if (current == null || current.projects() != projects) {
+            current = ProjectIndex.of(projects);
+            index = current;
+        }
+        return current;
     }
 
     private File find(MavenProject project, Artifact requestedArtifact)
@@ -217,5 +214,26 @@ public final class AllProjectsReactorWorkspaceReader
     {
         String classifier = artifact.getClassifier();
         return classifier != null && !classifier.isEmpty();
+    }
+
+    private record ProjectIndex(
+            List<MavenProject> projects,
+            Map<String, MavenProject> projectsByGav,
+            Map<String, List<MavenProject>> projectsByGa)
+    {
+        static final ProjectIndex EMPTY = new ProjectIndex(List.of(), Map.of(), Map.of());
+
+        static ProjectIndex of(List<MavenProject> projects)
+        {
+            Map<String, MavenProject> projectsByGav = new HashMap<>();
+            Map<String, List<MavenProject>> projectsByGa = new HashMap<>();
+            for (MavenProject project : projects) {
+                String gav = ArtifactUtils.key(project.getGroupId(), project.getArtifactId(), project.getVersion());
+                String ga = ArtifactUtils.versionlessKey(project.getGroupId(), project.getArtifactId());
+                projectsByGav.put(gav, project);
+                projectsByGa.computeIfAbsent(ga, _ -> new ArrayList<>()).add(project);
+            }
+            return new ProjectIndex(projects, projectsByGav, projectsByGa);
+        }
     }
 }
